@@ -425,6 +425,8 @@ if __name__ == '__main__':
                             init_line = f"{tsf},initialized,{name}"
                             print(init_line, file=sys.__stdout__)
                             sim_log.write(init_line + "\n")
+                            # Record spawn event for reproducibility
+                            f_input.write(f"{tsf},initialized,{name}\n")
                         else:
                             # Subsequent press: node_update with random integer coords
                             t_int = int(t)
