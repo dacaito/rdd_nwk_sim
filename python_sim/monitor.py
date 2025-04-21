@@ -11,6 +11,11 @@ import os
 import sys
 import time
 import argparse
+import threading
+import select
+import termios
+import tty
+from collections import deque
 from collections import deque
 
 try:
@@ -33,13 +38,26 @@ def tail_f(path):
             yield line.rstrip("\n")
 
 class Monitor:
-    def __init__(self, nodes):
-        self.nodes = list(nodes)
-        # last 5 events per node: deque of (ts, typ, other)
+    def __init__(self):
+        # dynamic list of nodes (populated via 'initialized' events)
+        self.nodes = []
         # unlimited history of events per node: deque of (ts, typ, other)
-        self.events = {n: deque() for n in self.nodes}
+        self.events = {}
         # connectivity matrix: for each dst, set of src nodes that can reach it
-        self.connectivity = {n: set() for n in self.nodes}
+        self.connectivity = {}
+        # latest state snapshot per node
+        # { node: { 'uptime': str, 'entries': [(name,ts,lat,lon), ...] } }
+        self.states = {}
+        # view mode: 'events' or 'state'
+        self.mode = 'events'
+
+    def add_node(self, name):
+        if name in self.nodes:
+            return
+        self.nodes.append(name)
+        self.events[name] = deque()
+        self.connectivity[name] = set()
+        self.states[name] = None
 
     def parse_line(self, line):
         parts = line.split(',', 2)
@@ -49,6 +67,11 @@ class Monitor:
         try:
             ts = float(ts_s)
         except ValueError:
+            return
+        # handle node initialization
+        if ev == 'initialized':  # format: ts,initialized,NODx
+            name = parts[2]
+            self.add_node(name)
             return
         # events
         if ev == 'connectivity_update':
@@ -77,8 +100,27 @@ class Monitor:
             src, dst = fields[0], fields[1]
             # record receive event only; source TX is already captured by 'tx'
             self.events[dst].append((ts, 'RX', src))
+        elif ev == 'state':
+            # format: ts,state,dst,get_state,<uptime_ms>,<NAME1>,<TS1>,<LAT1>,<LON1>,...
+            rest = parts[2].split(',', 1)
+            if len(rest) < 2:
+                return
+            dst, state_str = rest
+            sp = state_str.split(',')
+            if not sp or sp[0] != 'get_state':
+                return
+            uptime = sp[1]
+            entries = sp[2:]
+            node_list = []
+            for i in range(len(entries) // 4):
+                name_i, ts_i, lat_i, lon_i = entries[4*i:4*i+4]
+                node_list.append((name_i, ts_i, lat_i, lon_i))
+            self.states[dst] = {'uptime': uptime, 'entries': node_list}
 
     def generate_view(self):
+        # choose view based on mode
+        if self.mode == 'state':
+            return self.generate_state_view()
         panels = []
         for n in self.nodes:
             text = Text()
@@ -94,31 +136,71 @@ class Monitor:
             panels.append(Panel(text, title=n, expand=True))
         return Columns(panels)
 
+    def generate_state_view(self):
+        panels = []
+        for n in self.nodes:
+            text = Text()
+            st = self.states.get(n)
+            if st:
+                text.append(f"Uptime: {st['uptime']} ms\n", style="green")
+                peers = sorted(self.connectivity.get(n, []))
+                peers_str = ", ".join(peers) if peers else "<none>"
+                text.append(f"Peers in: {peers_str}\n", style="cyan")
+                text.append("Entries:\n", style="magenta")
+                for name_i, ts_i, lat_i, lon_i in st['entries']:
+                    text.append(f" {name_i}: ts={ts_i}, lat={lat_i}, lon={lon_i}\n")
+            else:
+                text.append("No state yet\n", style="red")
+            panels.append(Panel(text, title=n, expand=True))
+        return Columns(panels)
+
 def main():
     parser = argparse.ArgumentParser(description="Live monitor for sim_output.log")
-    parser.add_argument('--nodes', nargs='+', required=True,
-                        help='List of node names (e.g. NOD1 NOD2)')
     parser.add_argument('--log', default='sim_output.log',
-                        help='Path to sim_output.log file')
+                        help='Path to sim_output.log file, or - to read from stdin')
+    parser.add_argument('--mode', choices=['events','state'], default='events',
+                        help='Select display mode: events or state')
     args = parser.parse_args()
 
-    # Determine input source: file tail or stdin pipe
+    # Determine input source and escape support
     if args.log == '-':
-        # read directly from stdin
         lines = (line.rstrip("\n") for line in sys.stdin)
+        use_escape = False
     else:
-        # wait for log file to appear
         while not os.path.exists(args.log):
             time.sleep(0.1)
         lines = tail_f(args.log)
+        use_escape = sys.stdin.isatty()
 
-    mon = Monitor(args.nodes)
-    with Live(mon.generate_view(), refresh_per_second=4, screen=True) as live:
-        for line in lines:
-            if not line:
-                continue
-            mon.parse_line(line)
-            live.update(mon.generate_view())
+    # Setup ESC listener to exit
+    stop_event = threading.Event()
+    if use_escape:
+        fd = sys.stdin.fileno()
+        orig_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        def esc_listener():
+            while not stop_event.is_set():
+                dr, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if dr and sys.stdin.read(1) == '\x1b':
+                    stop_event.set()
+        threading.Thread(target=esc_listener, daemon=True).start()
+
+    mon = Monitor()
+    mon.mode = args.mode
+    try:
+        with Live(mon.generate_view(), refresh_per_second=4, screen=True) as live:
+            for line in lines:
+                if use_escape and stop_event.is_set():
+                    break
+                if not line:
+                    continue
+                mon.parse_line(line)
+                live.update(mon.generate_view())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if use_escape:
+            termios.tcsetattr(fd, termios.TCSADRAIN, orig_settings)
 
 if __name__ == '__main__':
     main()
