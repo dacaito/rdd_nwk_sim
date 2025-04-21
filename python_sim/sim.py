@@ -1,4 +1,20 @@
-#!/usr/bin/env python3
+#!./sim_venv/bin/python3
+import os
+import sys
+
+# Auto re-exec using virtualenv python if not already
+def _ensure_venv():
+    here = os.path.dirname(os.path.abspath(__file__))
+    if sys.platform == 'win32':
+        venv_py = os.path.join(here, 'sim_venv', 'Scripts', 'python.exe')
+    else:
+        venv_py = os.path.join(here, 'sim_venv', 'bin', 'python')
+    if os.path.exists(venv_py):
+        venv_py = os.path.abspath(venv_py)
+        if os.path.abspath(sys.executable) != venv_py:
+            os.execv(venv_py, [venv_py] + sys.argv)
+
+_ensure_venv()
 import random
 """
 LoRa Network Simulator Orchestrator
@@ -21,6 +37,15 @@ import random
 import select
 import termios
 import tty
+from collections import deque
+try:
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.text import Text
+except ImportError:
+    print("Error: please install rich (pip install rich)", file=sys.stderr)
+    sys.exit(1)
 
 # Tee stdout to both console and sim_output.log file
 class Tee:
@@ -170,6 +195,13 @@ class Dispatcher:
                         # Log packet forwarding with sim timestamp
                         ts = node._timestamp()
                         print(f"{ts:.3f},forward,{src},{dst},{hexdata}", flush=True)
+                        # Upon receipt, fetch and emit the node's state for live monitoring
+                        try:
+                            state_resp = node.get_state(timeout=0.2)
+                            if state_resp:
+                                print(f"{ts:.3f},state,{dst},{state_resp}", flush=True)
+                        except Exception:
+                            pass
 
 def load_events(input_file):
     events = []
@@ -195,6 +227,117 @@ def load_events(input_file):
     events.sort(key=lambda x: x[0])
     return events
 
+# Monitor live display code merged from monitor.py
+def tail_f(path):
+    with open(path, 'r') as f:
+        f.seek(0, os.SEEK_END)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.1)
+                continue
+            yield line.rstrip("\n")
+
+class Monitor:
+    def __init__(self):
+        self.nodes = []
+        self.events = {}
+        self.connectivity = {}
+        self.states = {}
+        self.mode = 'events'
+
+    def add_node(self, name):
+        if name in self.nodes:
+            return
+        self.nodes.append(name)
+        self.events[name] = deque()
+        self.connectivity[name] = set()
+        self.states[name] = None
+
+    def parse_line(self, line):
+        parts = line.split(',', 2)
+        if len(parts) < 2:
+            return
+        ts_s, ev = parts[0], parts[1]
+        try:
+            ts = float(ts_s)
+        except ValueError:
+            return
+        if ev == 'initialized':
+            name = parts[2]
+            self.add_node(name)
+            return
+        if ev == 'connectivity_update':
+            matrix = parts[2]
+            N = len(self.nodes)
+            for i, src in enumerate(self.nodes):
+                for j, dst in enumerate(self.nodes):
+                    if matrix[i*N + j] == '1':
+                        self.connectivity[dst].add(src)
+                    else:
+                        self.connectivity[dst].discard(src)
+        elif ev == 'tx':
+            fields = parts[2].split(',', 1)
+            if len(fields) < 1:
+                return
+            src = fields[0]
+            self.events[src].append((ts, 'TX', 'TX'))
+        elif ev == 'forward':
+            fields = parts[2].split(',', 2)
+            if len(fields) < 2:
+                return
+            src, dst = fields[0], fields[1]
+            self.events[dst].append((ts, 'RX', src))
+        elif ev == 'state':
+            rest = parts[2].split(',', 1)
+            if len(rest) < 2:
+                return
+            dst, state_str = rest
+            sp = state_str.split(',')
+            if not sp or sp[0] != 'get_state':
+                return
+            uptime = sp[1]
+            entries = sp[2:]
+            node_list = []
+            for i in range(len(entries) // 4):
+                name_i, ts_i, lat_i, lon_i = entries[4*i:4*i+4]
+                node_list.append((name_i, ts_i, lat_i, lon_i))
+            self.states[dst] = {'uptime': uptime, 'entries': node_list}
+
+    def generate_view(self):
+        if self.mode == 'state':
+            return self.generate_state_view()
+        panels = []
+        for n in sorted(self.nodes):
+            text = Text()
+            peers = sorted(self.connectivity.get(n, []))
+            peers_str = ", ".join(peers) if peers else "<none>"
+            text.append(f"Peers in: {peers_str}\n", style="cyan")
+            text.append("Last events:\n", style="magenta")
+            for ts, typ, other in list(self.events[n]):
+                arrow = "→" if typ == 'TX' else "←"
+                text.append(f" {ts:6.3f}s {arrow} {other}\n")
+            panels.append(Panel(text, title=n, expand=True))
+        return Columns(panels)
+
+    def generate_state_view(self):
+        panels = []
+        for n in sorted(self.nodes):
+            text = Text()
+            st = self.states.get(n)
+            if st:
+                text.append(f"Uptime: {st['uptime']} ms\n", style="green")
+                peers = sorted(self.connectivity.get(n, []))
+                peers_str = ", ".join(peers) if peers else "<none>"
+                text.append(f"Peers in: {peers_str}\n", style="cyan")
+                text.append("Entries:\n", style="magenta")
+                for name_i, ts_i, lat_i, lon_i in st['entries']:
+                    text.append(f" {name_i}: ts={ts_i}, lat={lat_i}, lon={lon_i}\n")
+            else:
+                text.append("No state yet\n", style="red")
+            panels.append(Panel(text, title=n, expand=True))
+        return Columns(panels)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="LoRa network simulator orchestrator")
     parser.add_argument('--input', default='input.log', help='Input command file')
@@ -205,12 +348,18 @@ if __name__ == '__main__':
     parser.add_argument('--outdir', default='.', help='Directory for node log files')
     parser.add_argument('--duration', type=float, default=None,
                         help='Optional simulation duration in seconds')
+    parser.add_argument('--monitor', choices=['events', 'state'], default=None,
+                        help='Enable live monitor display using Rich')
     args = parser.parse_args()
 
     # Setup sim_output.log to capture all orchestrator stdout
     log_path = os.path.join(args.outdir, 'sim_output.log')
     sim_log = open(log_path, 'w', buffering=1)
-    sys.stdout = Tee(sys.stdout, sim_log)
+    # Determine output streams: in monitor mode, send CSV only to log; otherwise, also to console
+    if args.monitor:
+        sys.stdout = Tee(sim_log)
+    else:
+        sys.stdout = Tee(sys.stdout, sim_log)
 
     # Prepare
     start_time = time.time()
@@ -253,6 +402,18 @@ if __name__ == '__main__':
 
     # Listen for Escape key to stop simulation and jump to get_state
     stop_event = threading.Event()
+    # Start live monitor if requested
+    if args.monitor:
+        mon = Monitor()
+        mon.mode = args.monitor
+        def monitor_loop():
+            with Live(mon.generate_view(), refresh_per_second=4, screen=True) as live:
+                for line in tail_f(log_path):
+                    if stop_event.is_set():
+                        break
+                    mon.parse_line(line)
+                    live.update(mon.generate_view())
+        threading.Thread(target=monitor_loop, daemon=True).start()
     if sys.stdin.isatty():
         fd = sys.stdin.fileno()
         orig_settings = termios.tcgetattr(fd)
@@ -280,6 +441,9 @@ if __name__ == '__main__':
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_settings)
 
     # -- Final state dump --
+    # Restore stdout to console for final summary if in monitor mode
+    if args.monitor:
+        sys.stdout = sys.__stdout__
     print("\nFinal node states:")
     for name in args.nodes:
         np = nodes[name]
