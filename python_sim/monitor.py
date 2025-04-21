@@ -122,7 +122,8 @@ class Monitor:
         if self.mode == 'state':
             return self.generate_state_view()
         panels = []
-        for n in self.nodes:
+        # always display nodes in sorted order
+        for n in sorted(self.nodes):
             text = Text()
             # connectivity
             peers = sorted(self.connectivity.get(n, []))
@@ -138,7 +139,8 @@ class Monitor:
 
     def generate_state_view(self):
         panels = []
-        for n in self.nodes:
+        # always display nodes in sorted order
+        for n in sorted(self.nodes):
             text = Text()
             st = self.states.get(n)
             if st:
