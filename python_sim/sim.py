@@ -342,7 +342,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="LoRa network simulator orchestrator")
     parser.add_argument('--input', default=None,
                         help='Input command file; if omitted, enters interactive builder mode')
-    parser.add_argument('--nodes', nargs='+', default=['NOD1', 'NOD2', 'NOD3', 'NOD4'],
+    parser.add_argument('--nodes', nargs='+', default=['ND01', 'ND02', 'ND03', 'ND04'],
                         help='List of node names')
     parser.add_argument('--node-exe', default='./network_simulator',
                         help='Path to network_simulator executable')
@@ -381,23 +381,15 @@ if __name__ == '__main__':
         line0 = f"{0.000:.3f},connectivity_update,{matrix_str}"
         print(line0, file=sys.__stdout__)
         sim_log.write(line0 + "\n")
-        # Spawn all nodes at t=0, with connectivity applied
+        # Prepare simulation start and apply connectivity matrix
         start_time = time.time()
         dispatcher = Dispatcher(args.nodes)
-        # Apply connectivity matrix internally
         N = len(args.nodes)
         for i, src in enumerate(args.nodes):
             for j, dst in enumerate(args.nodes):
                 dispatcher.conn[src][dst] = (matrix_str[i*N + j] == '1')
+        # No nodes spawned yet; wait for keypress to spawn or update
         nodes = {}
-        for name in args.nodes:
-            np = NodeProc(name, args.node_exe, args.outdir, start_time, dispatcher)
-            dispatcher.register(np)
-            ts = np._timestamp()
-            init_line = f"{ts:.3f},initialized,{name}"
-            print(init_line, file=sys.__stdout__)
-            sim_log.write(init_line + "\n")
-            nodes[name] = np
         # Live key loop for node_update events
         print(f"Press keys 1-{len(args.nodes)} to generate node_update; ESC to finish.", file=sys.__stdout__)
         fd = sys.stdin.fileno()
@@ -416,14 +408,25 @@ if __name__ == '__main__':
                     if 0 <= idx < len(args.nodes):
                         name = args.nodes[idx]
                         t = time.time() - start_time
-                        t_int = int(t)
-                        lat = random.randint(0, 100)
-                        lon = random.randint(0, 100)
-                        cmd = f"node_update,{name},{t_int},{lat},{lon}"
-                        nodes[name].send_command(cmd)
-                        evt = f"{t:.3f},send_command,{name},{cmd}"
-                        print(f"Generated node_update for {name} at {t_int}s: {lat},{lon}", file=sys.__stdout__)
-                        sim_log.write(evt + "\n")
+                        tsf = f"{t:.3f}"
+                        if name not in nodes:
+                            # First press: spawn node
+                            np = NodeProc(name, args.node_exe, args.outdir, start_time, dispatcher)
+                            dispatcher.register(np)
+                            nodes[name] = np
+                            init_line = f"{tsf},initialized,{name}"
+                            print(init_line, file=sys.__stdout__)
+                            sim_log.write(init_line + "\n")
+                        else:
+                            # Subsequent press: node_update with random integer coords
+                            t_int = int(t)
+                            lat = random.randint(0, 100)
+                            lon = random.randint(0, 100)
+                            cmd = f"node_update,{name},{t_int},{lat},{lon}"
+                            nodes[name].send_command(cmd)
+                            evt = f"{tsf},send_command,{name},{cmd}"
+                            print(f"Generated node_update for {name} at {t_int}s: {lat},{lon}", file=sys.__stdout__)
+                            sim_log.write(evt + "\n")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, orig_settings)
         # Final state dump
