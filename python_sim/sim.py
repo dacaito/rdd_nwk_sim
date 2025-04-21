@@ -359,54 +359,93 @@ if __name__ == '__main__':
                         help='Random seed for spawn offsets when not provided')
     args = parser.parse_args()
 
-    # Interactive builder mode: record connectivity matrix and spawn times if no input file
+    # Interactive simulation: prompt for connectivity, spawn nodes, and accept live node_update via keys
     if args.input is None:
         # Prompt for connectivity matrix as raw bitstrings
-        print("Interactive builder mode: enter connectivity rows for each node", file=sys.__stdout__)
+        print("Interactive mode: enter connectivity for each node (bitstrings, no commas)", file=sys.__stdout__)
         matrix_rows = []
         for name in args.nodes:
             while True:
-                resp = input(f"{name} reaches (bitstring of length {len(args.nodes)}, e.g. " +
+                resp = input(f"{name} reaches (bitstring length {len(args.nodes)}, e.g. "
                              f"{'0'*(len(args.nodes)-1)}1): ").strip()
                 if len(resp) != len(args.nodes) or any(c not in ('0', '1') for c in resp):
-                    print(f"Invalid entry, need {len(args.nodes)} digits of 0 or 1", file=sys.__stdout__)
+                    print(f"Invalid: need {len(args.nodes)} digits 0/1", file=sys.__stdout__)
                 else:
                     matrix_rows.append(resp)
                     break
         matrix_str = ''.join(matrix_rows)
-        # Write events to interactive input file
-        input_ts_path = os.path.join(args.outdir, 'input_ts.log')
-        spawn_times = {}
-        start_t = time.time()
+        # Prepare simulation logs
+        log_path = os.path.join(args.outdir, 'sim_output.log')
+        sim_log = open(log_path, 'w', buffering=1)
+        # Log connectivity_update at t=0
+        line0 = f"{0.000:.3f},connectivity_update,{matrix_str}"
+        print(line0, file=sys.__stdout__)
+        sim_log.write(line0 + "\n")
+        # Spawn all nodes at t=0, with connectivity applied
+        start_time = time.time()
+        dispatcher = Dispatcher(args.nodes)
+        # Apply connectivity matrix internally
+        N = len(args.nodes)
+        for i, src in enumerate(args.nodes):
+            for j, dst in enumerate(args.nodes):
+                dispatcher.conn[src][dst] = (matrix_str[i*N + j] == '1')
+        nodes = {}
+        for name in args.nodes:
+            np = NodeProc(name, args.node_exe, args.outdir, start_time, dispatcher)
+            dispatcher.register(np)
+            ts = np._timestamp()
+            init_line = f"{ts:.3f},initialized,{name}"
+            print(init_line, file=sys.__stdout__)
+            sim_log.write(init_line + "\n")
+            nodes[name] = np
+        # Live key loop for node_update events
+        print(f"Press keys 1-{len(args.nodes)} to generate node_update; ESC to finish.", file=sys.__stdout__)
         fd = sys.stdin.fileno()
         orig_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
         try:
-            with open(input_ts_path, 'w', buffering=1) as f:
-                print(f"Recording to {input_ts_path}. Press 1-{len(args.nodes)} to record spawn; ESC to finish.", file=sys.__stdout__)
-                while len(spawn_times) < len(args.nodes):
-                    dr, _, _ = select.select([sys.stdin], [], [], 0.1)
-                    if not dr:
-                        continue
-                    ch = sys.stdin.read(1)
-                    if ch == '\x1b':
-                        break
-                    if ch.isdigit():
-                        idx = int(ch) - 1
-                        if 0 <= idx < len(args.nodes) and args.nodes[idx] not in spawn_times:
-                            t = time.time() - start_t
-                            spawn_times[args.nodes[idx]] = t
-                            # Record connectivity update event at this timestamp
-                            f.write(f"{t:.3f},-1,{matrix_str}\n")
-                            print(f"Recorded connectivity_update at {t:.3f}s for {args.nodes[idx]}", file=sys.__stdout__)
+            while True:
+                dr, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if not dr:
+                    continue
+                ch = sys.stdin.read(1)
+                if ch == '\x1b':  # ESC
+                    break
+                if ch.isdigit():
+                    idx = int(ch) - 1
+                    if 0 <= idx < len(args.nodes):
+                        name = args.nodes[idx]
+                        t = time.time() - start_time
+                        t_int = int(t)
+                        lat = random.randint(0, 100)
+                        lon = random.randint(0, 100)
+                        cmd = f"node_update,{name},{t_int},{lat},{lon}"
+                        nodes[name].send_command(cmd)
+                        evt = f"{t:.3f},send_command,{name},{cmd}"
+                        print(f"Generated node_update for {name} at {t_int}s: {lat},{lon}", file=sys.__stdout__)
+                        sim_log.write(evt + "\n")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, orig_settings)
-        # Configure for simulation
-        args.input = input_ts_path
-        args.spawn_offsets = [spawn_times.get(name, 0.0) for name in args.nodes]
-        print(f"Interactive input complete. Using {input_ts_path}", file=sys.__stdout__)
-        print(f"Spawn offsets: {args.spawn_offsets}", file=sys.__stdout__)
-        # Fall through to simulation runner
+        # Final state dump
+        print("\nFinal node states:", file=sys.__stdout__)
+        for name, np in nodes.items():
+            resp = np.get_state(timeout=1.0)
+            print(f"\n{name}:", file=sys.__stdout__)
+            if not resp:
+                print("  <no response>", file=sys.__stdout__)
+            else:
+                parts = resp.split(',')
+                data = parts[2:]
+                print(f"    {'Node':>4} {'TS':>5} {'Lat':>5} {'Lon':>5}", file=sys.__stdout__)
+                for i in range(len(data)//4):
+                    ename, ets, elat, elon = data[4*i:4*i+4]
+                    print(f"    {ename:>4} {ets:>5} {elat:>5} {elon:>5}", file=sys.__stdout__)
+        # Terminate nodes
+        for np in nodes.values():
+            np.terminate()
+        print("Simulation terminated.", file=sys.__stdout__)
+        sim_log.close()
+        sys.exit(0)
     log_path = os.path.join(args.outdir, 'sim_output.log')
     sim_log = open(log_path, 'w', buffering=1)
     # Determine output streams: in monitor mode, send CSV only to log; otherwise, also to console
