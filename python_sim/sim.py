@@ -374,6 +374,14 @@ if __name__ == '__main__':
                     matrix_rows.append(resp)
                     break
         matrix_str = ''.join(matrix_rows)
+        # Prepare input file for reproducibility
+        ts_label = int(time.time())
+        input_fn = f"input_{ts_label}.log"
+        input_path = os.path.join(args.outdir, input_fn)
+        f_input = open(input_path, 'w', buffering=1)
+        # Record initial connectivity update
+        f_input.write(f"{0.000:.3f},-1,{matrix_str}\n")
+        print(f"Inputs will be saved to {input_fn}", file=sys.__stdout__)
         # Prepare simulation logs
         log_path = os.path.join(args.outdir, 'sim_output.log')
         sim_log = open(log_path, 'w', buffering=1)
@@ -427,6 +435,8 @@ if __name__ == '__main__':
                             evt = f"{tsf},send_command,{name},{cmd}"
                             print(f"Generated node_update for {name} at {t_int}s: {lat},{lon}", file=sys.__stdout__)
                             sim_log.write(evt + "\n")
+                            # Record update in input file
+                            f_input.write(f"{tsf},{name},{cmd}\n")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, orig_settings)
         # Final state dump
@@ -447,6 +457,11 @@ if __name__ == '__main__':
         for np in nodes.values():
             np.terminate()
         print("Simulation terminated.", file=sys.__stdout__)
+        # Close input file for reproducibility
+        try:
+            f_input.close()
+        except Exception:
+            pass
         sim_log.close()
         sys.exit(0)
     log_path = os.path.join(args.outdir, 'sim_output.log')
