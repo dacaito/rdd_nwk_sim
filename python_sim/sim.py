@@ -366,12 +366,12 @@ if __name__ == '__main__':
         matrix_rows = []
         for name in args.nodes:
             while True:
-                resp = input(f"{name} reaches (comma-separated 0/1 for {', '.join(args.nodes)}): ").strip()
-                parts = [c.strip() for c in resp.split(',')]
-                if len(parts) != len(args.nodes) or any(p not in ('0', '1') for p in parts):
-                    print(f"Invalid entry, need {len(args.nodes)} values of 0 or 1", file=sys.__stdout__)
+                resp = input(f"{name} reaches (bitstring of length {len(args.nodes)}, e.g. {'0'* (len(args.nodes)-1) + '1'}): ").strip()
+                # Expect a raw bitstring (no commas)
+                if len(resp) != len(args.nodes) or any(c not in ('0', '1') for c in resp):
+                    print(f"Invalid entry, need {len(args.nodes)} digits of 0 or 1 (e.g. 0101)", file=sys.__stdout__)
                 else:
-                    matrix_rows.append(''.join(parts))
+                    matrix_rows.append(resp)
                     break
         matrix_str = ''.join(matrix_rows)
         # Prepare logs
