@@ -340,7 +340,8 @@ class Monitor:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="LoRa network simulator orchestrator")
-    parser.add_argument('--input', default='input.log', help='Input command file')
+    parser.add_argument('--input', default=None,
+                        help='Input command file; if omitted, enters interactive builder mode')
     parser.add_argument('--nodes', nargs='+', default=['NOD1', 'NOD2', 'NOD3', 'NOD4'],
                         help='List of node names')
     parser.add_argument('--node-exe', default='./network_simulator',
@@ -350,9 +351,59 @@ if __name__ == '__main__':
                         help='Optional simulation duration in seconds')
     parser.add_argument('--monitor', choices=['events', 'state'], default=None,
                         help='Enable live monitor display using Rich')
+    parser.add_argument('--spawn-offsets', nargs='+', type=float,
+                        help='List of per-node spawn offsets (seconds). Overrides random offsets.')
+    parser.add_argument('--spawn-max', type=float, default=5.0,
+                        help='Maximum random spawn offset (seconds)')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='Random seed for spawn offsets when not provided')
     args = parser.parse_args()
 
-    # Setup sim_output.log to capture all orchestrator stdout
+    # If no input file specified, enter interactive builder mode
+    if args.input is None:
+        # Interactive builder: prompt for connectivity matrix and spawn timing
+        print("Interactive input mode: please enter connectivity rows for each node", file=sys.__stdout__)
+        matrix_rows = []
+        for name in args.nodes:
+            while True:
+                resp = input(f"{name} reaches (comma-separated 0/1 for {', '.join(args.nodes)}): ").strip()
+                parts = [c.strip() for c in resp.split(',')]
+                if len(parts) != len(args.nodes) or any(p not in ('0', '1') for p in parts):
+                    print(f"Invalid entry, need {len(args.nodes)} values of 0 or 1", file=sys.__stdout__)
+                else:
+                    matrix_rows.append(''.join(parts))
+                    break
+        matrix_str = ''.join(matrix_rows)
+        # Prepare input_ts.log
+        input_ts_path = os.path.join(args.outdir, 'input_ts.log')
+        print(f"Recording connectivity updates to {input_ts_path}", file=sys.__stdout__)
+        with open(input_ts_path, 'w', buffering=1) as f:
+            interactive_start = time.time()
+            spawned = set()
+            print(f"Press number (1-{len(args.nodes)}) to 'spawn' node; after each, connectivity update will be recorded.", file=sys.__stdout__)
+            while len(spawned) < len(args.nodes):
+                resp = input(f"Spawn node (1-{len(args.nodes)}) or 'q' to finish: ").strip()
+                if resp.lower() == 'q':
+                    break
+                if not resp.isdigit():
+                    print("Invalid input", file=sys.__stdout__)
+                    continue
+                idx = int(resp) - 1
+                if idx < 0 or idx >= len(args.nodes):
+                    print("Number out of range", file=sys.__stdout__)
+                    continue
+                name = args.nodes[idx]
+                if name in spawned:
+                    print(f"{name} already spawned", file=sys.__stdout__)
+                    continue
+                spawned.add(name)
+                ts = time.time() - interactive_start
+                # Record connectivity update event
+                f.write(f"{ts:.3f},-1,{matrix_str}\n")
+                print(f"Recorded connectivity_update at {ts:.3f}s", file=sys.__stdout__)
+        print("Interactive input complete. You can now run simulation with:", file=sys.__stdout__)
+        print(f"  sim.py --input {input_ts_path}", file=sys.__stdout__)
+        sys.exit(0)
     log_path = os.path.join(args.outdir, 'sim_output.log')
     sim_log = open(log_path, 'w', buffering=1)
     # Determine output streams: in monitor mode, send CSV only to log; otherwise, also to console
@@ -361,13 +412,28 @@ if __name__ == '__main__':
     else:
         sys.stdout = Tee(sys.stdout, sim_log)
 
-    # Prepare
+    # Prepare simulation
     start_time = time.time()
     dispatcher = Dispatcher(args.nodes)
-    # Spawn nodes
+
+    # Determine spawn offsets (absolute seconds since start)
+    if args.spawn_offsets:
+        if len(args.spawn_offsets) != len(args.nodes):
+            print(f"Error: --spawn-offsets length {len(args.spawn_offsets)} != number of nodes {len(args.nodes)}", file=sys.stderr)
+            sys.exit(1)
+        offsets = args.spawn_offsets
+    else:
+        random.seed(args.seed)
+        offsets = [random.uniform(0, args.spawn_max) for _ in args.nodes]
+
+    # Spawn nodes at specified offsets (sorted by offset)
+    schedule = sorted(zip(offsets, args.nodes), key=lambda x: x[0])
     nodes = {}
-    for name in args.nodes:
-        time.sleep(random.uniform(0,5))
+    for offset, name in schedule:
+        now = time.time() - start_time
+        to_sleep = offset - now
+        if to_sleep > 0:
+            time.sleep(to_sleep)
         np = NodeProc(name, args.node_exe, args.outdir, start_time, dispatcher)
         dispatcher.register(np)
         # Log node initialization event
