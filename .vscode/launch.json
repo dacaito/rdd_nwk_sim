@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Network Simulator",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/network_simulator",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build and Run",
+            "stopAtEntry": false,
+            "MIMode": "lldb"
+        }
+    ]
+}
