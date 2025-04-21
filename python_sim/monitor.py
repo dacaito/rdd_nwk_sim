@@ -36,7 +36,8 @@ class Monitor:
     def __init__(self, nodes):
         self.nodes = list(nodes)
         # last 5 events per node: deque of (ts, typ, other)
-        self.events = {n: deque(maxlen=5) for n in self.nodes}
+        # unlimited history of events per node: deque of (ts, typ, other)
+        self.events = {n: deque() for n in self.nodes}
         # connectivity matrix: for each dst, set of src nodes that can reach it
         self.connectivity = {n: set() for n in self.nodes}
 
@@ -66,16 +67,15 @@ class Monitor:
             if len(fields) < 1:
                 return
             src = fields[0]
-            # record tx event
-            self.events[src].append((ts, 'TX', ''))
+            # record tx event (no destination, just mark TX)
+            self.events[src].append((ts, 'TX', 'TX'))
         elif ev == 'forward':
             # format: ts,forward,src,dst,HEXDATA
             fields = parts[2].split(',', 2)
             if len(fields) < 2:
                 return
             src, dst = fields[0], fields[1]
-            # record tx to dst and rx from src
-            self.events[src].append((ts, 'TX', dst))
+            # record receive event only; source TX is already captured by 'tx'
             self.events[dst].append((ts, 'RX', src))
 
     def generate_view(self):
@@ -102,13 +102,21 @@ def main():
                         help='Path to sim_output.log file')
     args = parser.parse_args()
 
-    # wait for log file
-    while not os.path.exists(args.log):
-        time.sleep(0.1)
+    # Determine input source: file tail or stdin pipe
+    if args.log == '-':
+        # read directly from stdin
+        lines = (line.rstrip("\n") for line in sys.stdin)
+    else:
+        # wait for log file to appear
+        while not os.path.exists(args.log):
+            time.sleep(0.1)
+        lines = tail_f(args.log)
 
     mon = Monitor(args.nodes)
     with Live(mon.generate_view(), refresh_per_second=4, screen=True) as live:
-        for line in tail_f(args.log):
+        for line in lines:
+            if not line:
+                continue
             mon.parse_line(line)
             live.update(mon.generate_view())
 
